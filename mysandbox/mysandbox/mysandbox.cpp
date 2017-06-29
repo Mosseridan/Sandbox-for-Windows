@@ -4,11 +4,11 @@
 #include "stdafx.h"
 #include "mysandbox.h"
 
+int _tmain(int argc, TCHAR *argv[]){
 
-int main(int argc, char** argv)
-{	
 	DWORD result = 0, size = 0;
-	WCHAR command_line[MAX_PATH + 1] = { 0 };
+	TCHAR* command_line = NULL;
+	TCHAR* allowed_folder = NULL;
 	HWINSTA target_station;
 	HDESK target_desktop;
 	HANDLE job_handle = NULL;
@@ -16,16 +16,20 @@ int main(int argc, char** argv)
 	HANDLE lockdown_token = NULL;
 	HANDLE initial_token = NULL;
 	IPC* ipc;
-	PROCESS_INFORMATION process_info = { 0 };
+	PROCESS_INFORMATION process_info;
 
 	// parse command line.
-	if (argc < 3 || strcmp("-torun", argv[1])) {
-		fprintf(stderr, "Usage: -torun <TargetPath>\n");
+	if (argc != 5 || _tcscmp(TEXT("-torun"), argv[1]) || _tcscmp(TEXT("-folder"), argv[3])) {
+		fprintf(stderr, "Usage: -torun <TargetPath> -folder <AllowedFolderPath>\n");
 		return -1;
 	}
 
-	MultiByteToWideChar(0, 0, argv[2], strlen(argv[2]), command_line, strlen(argv[2]));
+	command_line = argv[2];
+	allowed_folder = argv[4];
 
+	// create allowed folder this folder will be the targets current directory
+	if ((result = CreateAllowedFolder(allowed_folder)) != 0)
+		goto BAD;
 
 	// create new station and desktop for the target process to run in 
 	if ((result = createStationAndDesktop(&target_station, &target_desktop)) != 0)
@@ -54,10 +58,9 @@ int main(int argc, char** argv)
 	if ((result = CreateInitialToken(&effective_token, &initial_token)) != 0)
 		goto BAD;
 
-	if ((result = SpawnTarget(&lockdown_token, &initial_token, &job_handle, &target_desktop, ipc, command_line, &process_info)) != 0)
+	if ((result = SpawnTarget(&lockdown_token, &initial_token, &job_handle, &target_desktop, ipc, command_line, allowed_folder, &process_info)) != 0)
 		goto BAD;
 
-	//ipc->loop();
 
 	WaitForSingleObject(process_info.hProcess, INFINITE);
 
@@ -75,6 +78,10 @@ int main(int argc, char** argv)
 		CloseHandle(lockdown_token);
 	if (initial_token)
 		CloseHandle(initial_token);
+	if (allowed_folder)
+		RemoveDirectory(allowed_folder);
+	if (ipc)
+		ipc->~IPC();
 	return 0;
 	
 	BAD:
@@ -93,9 +100,10 @@ int main(int argc, char** argv)
 			CloseHandle(lockdown_token);
 		if (initial_token)
 			CloseHandle(initial_token);
+		if(allowed_folder)
+			RemoveDirectory(allowed_folder);
 		return result;
 }
-
 
 
 
@@ -109,7 +117,8 @@ DWORD SpawnTarget(
 	__in PHANDLE job_handle,
 	__in HDESK* target_desktop,
 	__in IPC* ipc,
-	__in LPWSTR command_line,
+	__in TCHAR* command_line,
+	__in TCHAR* allowed_folder,
 	__out PPROCESS_INFORMATION process_info) {
 
 	DWORD result = 0, old_protection = 0, target_desktop_name_length = 0;
@@ -120,7 +129,10 @@ DWORD SpawnTarget(
 	LPVOID entry_point = 0;
 	BYTE first_two_bytes[2] = { 0 };
 	SIZE_T size = 0;
-	
+
+	ZeroMemory(process_info, sizeof(PROCESS_INFORMATION));
+	ZeroMemory(&startup_info, sizeof(STARTUPINFO));
+
 	GetStartupInfo(&startup_info);
 
 	// get the new desktops name length
@@ -142,27 +154,35 @@ DWORD SpawnTarget(
 		&target_desktop_name_length
 	);
 
-	// set targets desktop
+	//// set targets desktop
 	startup_info.lpDesktop = target_desktop_name;
+
 	// set targets standard in, out and error
-	/*startup_info.hStdError = ipc->target_write;
+	startup_info.hStdError = ipc->target_write;
 	startup_info.hStdOutput = ipc->target_write;
 	startup_info.hStdInput = ipc->target_read;
-	startup_info.dwFlags |= STARTF_USESTDHANDLES;*/
+	startup_info.dwFlags |= STARTF_USESTDHANDLES;
+
+	// select handles to inherit
+	HANDLE* handles_to_inherit = new HANDLE[2];
+	handles_to_inherit[0] = ipc->target_read;
+	handles_to_inherit[1] = ipc->target_write;
 
 	// create the target process suspended whithin the new station and desktop
 	// and whith the lockdown token as a primary token
-	if (!CreateProcessAsUser(*lockdown_token,
-		NULL,	// No name
-		command_line,
-		NULL,   // No security attribute.
-		NULL,   // No thread attribute.
-		FALSE,  // Do not inherit handles.
-		CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB,
-		NULL,   // Use the environment of the caller.
-		NULL,   // Use current directory of the caller.
-		&startup_info,
-		process_info)) {
+	if (!CreateProcessAsUserWithExplicitHandles(*lockdown_token, // the process token
+		NULL,				// application path
+		command_line,			// command line - 1st token is executable
+		NULL,					// default security attirubtes on process
+		NULL,					// default security attributes on thread
+		TRUE,					// inherit handles from parent
+		CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB,					// use normal priority class
+		NULL,					// inherit environment from parent
+		allowed_folder,				// use the current directory of parent
+		&startup_info,					// pointer to the STARTUPINFO
+		process_info,				// pointer to the PROCESSINFROMATION
+		2,
+		handles_to_inherit)) {
 		fprintf(stderr, "CreateProcessAsUser Error %u\n", result = GetLastError());
 		goto BAD;
 	}
@@ -215,7 +235,7 @@ DWORD SpawnTarget(
 	}
 
 	// Wait abit for target startup
-	Sleep(1000);
+	Sleep(2000);
 
 	// Suspend target again in order revert it to the lockdown token and repair its first two bytes 
 	if (SuspendThread(process_info->hThread) == -1) {
@@ -266,3 +286,113 @@ DWORD SpawnTarget(
 }
 
 
+DWORD CreateAllowedFolder(TCHAR* DirectoryName){
+	DWORD result = 0;
+	ULONG cb = MAX_SID_SIZE;
+	PACL Sacl = NULL;
+	PSID untrusted_sid = NULL;
+
+	untrusted_sid = (PSID)alloca(MAX_SID_SIZE);
+	if (!CreateWellKnownSid(WinUntrustedLabelSid, nullptr, untrusted_sid, &cb)) {
+		fprintf(stderr, "CreateWellKnownSid Error %u\n", result = GetLastError());
+		goto BAD;
+	}
+	
+	Sacl = (PACL)alloca(cb += sizeof(ACL) + sizeof(ACE_HEADER) + sizeof(ACCESS_MASK));
+	InitializeAcl(Sacl, cb, ACL_REVISION);
+	if (!AddMandatoryAce(Sacl, ACL_REVISION, 0, 0, untrusted_sid)) {
+		fprintf(stderr, "AddMandatoryAce Error %u\n", result = GetLastError());
+		goto BAD;
+	}
+	
+	SECURITY_ATTRIBUTES sa;
+	SECURITY_DESCRIPTOR sd;
+	InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+	SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
+	SetSecurityDescriptorSacl(&sd, TRUE, Sacl, FALSE);
+	sa.lpSecurityDescriptor = &sd;
+	sa.bInheritHandle = TRUE;
+	sa.nLength = sizeof sa;
+	if (!CreateDirectory(DirectoryName, &sa) && (result = GetLastError()) != ERROR_ALREADY_EXISTS) {
+		fprintf(stderr, "CreateDirectory Error %u\n", result = GetLastError());
+		goto BAD;
+	}
+
+	return 0;
+
+	BAD:
+		fprintf(stderr, "CreateUntrustedFolder Error %u\n", result);
+		return result;
+}
+
+
+
+// Specify white list of handles to inherit 
+// taken from https://blogs.msdn.microsoft.com/oldnewthing/20111216-00/?p=8873
+BOOL CreateProcessAsUserWithExplicitHandles(
+	__in		 HANDLE hToken,
+	__in_opt     LPCTSTR lpApplicationName,
+	__inout_opt  LPTSTR lpCommandLine,
+	__in_opt     LPSECURITY_ATTRIBUTES lpProcessAttributes,
+	__in_opt     LPSECURITY_ATTRIBUTES lpThreadAttributes,
+	__in         BOOL bInheritHandles,
+	__in         DWORD dwCreationFlags,
+	__in_opt     LPVOID lpEnvironment,
+	__in_opt     LPCTSTR lpCurrentDirectory,
+	__in         LPSTARTUPINFO lpStartupInfo,
+	__out        LPPROCESS_INFORMATION lpProcessInformation,
+	__in         DWORD numOfHandlesToInherit,
+	__in_ecount(cHandlesToInherit) HANDLE *rgHandlesToInherit)
+{
+	BOOL fInitialized = FALSE;
+	SIZE_T size = 0;
+	LPPROC_THREAD_ATTRIBUTE_LIST lpAttributeList = nullptr;
+
+	BOOL fSuccess = numOfHandlesToInherit < 0xFFFFFFFF / sizeof(HANDLE) &&
+		lpStartupInfo->cb == sizeof*lpStartupInfo;
+	if (!fSuccess) {
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return FALSE;
+	}
+	if (fSuccess) {
+		fSuccess = InitializeProcThreadAttributeList(nullptr, 1, 0, &size) ||
+			GetLastError() == ERROR_INSUFFICIENT_BUFFER;
+	}
+	if (fSuccess) {
+		lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>
+			(HeapAlloc(GetProcessHeap(), 0, size));
+		fSuccess = lpAttributeList != nullptr;
+	}
+	if (fSuccess) {
+		fSuccess = InitializeProcThreadAttributeList(lpAttributeList,
+			1, 0, &size);
+	}
+	if (fSuccess) {
+		fInitialized = TRUE;
+		fSuccess = UpdateProcThreadAttribute(lpAttributeList,
+			0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+			rgHandlesToInherit,
+			numOfHandlesToInherit * sizeof(HANDLE), nullptr, nullptr);
+	}
+	if (fSuccess) {
+		STARTUPINFOEX info;
+		ZeroMemory(&info, sizeof info);
+		info.StartupInfo = *lpStartupInfo;
+		info.StartupInfo.cb = sizeof info;
+		info.lpAttributeList = lpAttributeList;
+		fSuccess = CreateProcessAsUser(hToken, lpApplicationName,
+			lpCommandLine,
+			lpProcessAttributes,
+			lpThreadAttributes,
+			bInheritHandles,
+			dwCreationFlags | EXTENDED_STARTUPINFO_PRESENT,
+			lpEnvironment,
+			lpCurrentDirectory,
+			&info.StartupInfo,
+			lpProcessInformation);
+	}
+
+	if (fInitialized) DeleteProcThreadAttributeList(lpAttributeList);
+	if (lpAttributeList) HeapFree(GetProcessHeap(), 0, lpAttributeList);
+	return fSuccess;
+}

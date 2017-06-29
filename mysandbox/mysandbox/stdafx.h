@@ -9,10 +9,11 @@
 
 #include <stdio.h>
 #include <stdlib.h>  
+#include <iostream>
+#include <string>
 #include <Windows.h>
 #include <tchar.h>
-#include <Strsafe.h> 
-#include <string.h>  
+#include <Strsafe.h>  
 #include <Sddl.h>
 
 
